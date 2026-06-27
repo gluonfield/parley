@@ -21,32 +21,25 @@ import (
 	"github.com/gluonfield/parley/noise"
 )
 
-type role int
-
-const (
-	opener role = iota // Noise responder; waits for the joiner's first message
-	joiner             // Noise initiator; sends the first message
-)
-
-// A Session is one agent's end of one channel.
+// A Session is one agent's end of one channel. Whether this node opened or
+// joined is captured entirely by which constructor ran (responder vs initiator,
+// recorded in hs) and whether a topic was set — there is no separate role flag.
 type Session struct {
 	self  noise.Keypair
 	relay parley.Relay
 	host  string
 	caps  parley.Capabilities
 
-	mu       sync.Mutex
-	role     role
-	channel  parley.ChannelID
-	member   parley.Membership
-	topic    string
-	hs       *noise.Handshake
-	tx       parley.Transport
-	sendSeq  uint64
-	recvSeq  uint64
-	pending  []string // sends queued before the channel went live
-	peer     parley.Peer
-	sentDone bool
+	mu      sync.Mutex
+	channel parley.ChannelID
+	member  parley.Membership
+	topic   string
+	hs      *noise.Handshake
+	tx      parley.Transport
+	sendSeq uint64
+	recvSeq uint64
+	pending []string // sends queued before the channel went live
+	peer    parley.Peer
 }
 
 var _ parley.Session = (*Session)(nil)
@@ -78,7 +71,6 @@ func (s *Session) Open(ctx context.Context, topic string) (parley.Invite, error)
 		return parley.Invite{}, err
 	}
 
-	s.role = opener
 	s.channel = ch
 	s.member = member
 	s.topic = topic
@@ -101,7 +93,6 @@ func (s *Session) Join(ctx context.Context, in parley.Invite) error {
 	}
 	id := parley.Identity{Key: in.Key}
 
-	s.role = joiner
 	s.channel = in.Channel
 	s.member = member
 	s.hs = hs
@@ -118,7 +109,7 @@ func (s *Session) Join(ctx context.Context, in parley.Invite) error {
 func (s *Session) Send(ctx context.Context, text string) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	if s.sentDone {
+	if s.peer.State == parley.Closed {
 		return fmt.Errorf("parley/session: channel closed")
 	}
 	if s.tx == nil {
@@ -137,7 +128,7 @@ func (s *Session) Poll(ctx context.Context, wait time.Duration) ([]parley.Messag
 func (s *Session) Close(ctx context.Context, outcome string) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	if s.sentDone {
+	if s.peer.State == parley.Closed {
 		return nil
 	}
 	if s.tx != nil {
@@ -145,7 +136,6 @@ func (s *Session) Close(ctx context.Context, outcome string) error {
 			return err
 		}
 	}
-	s.sentDone = true
 	s.peer.State = parley.Closed
 	return nil
 }
@@ -215,7 +205,7 @@ func (s *Session) advanceHandshake(ctx context.Context, f parley.Frame) error {
 		return fmt.Errorf("parley/session: handshake: %w", err)
 	}
 	s.learn(got)
-	if s.role == opener && !s.hs.Done() {
+	if !s.hs.Done() { // a responder still owes the next handshake message
 		msg, err := s.hs.Write(s.payload())
 		if err != nil {
 			return fmt.Errorf("parley/session: handshake: %w", err)
@@ -232,10 +222,8 @@ func (s *Session) advanceHandshake(ctx context.Context, f parley.Frame) error {
 		s.tx = tx
 		s.peer.State = parley.Active
 		s.peer.Present = true
-		if s.role == opener {
-			id := parley.Identity{Key: s.hs.PeerStatic()}
-			s.peer.ID, s.peer.Fingerprint = id.ID(), id.Fingerprint()
-		}
+		id := parley.Identity{Key: s.hs.PeerStatic()}
+		s.peer.ID, s.peer.Fingerprint = id.ID(), id.Fingerprint()
 	}
 	return nil
 }
@@ -297,14 +285,10 @@ func (s *Session) refreshPresence(ctx context.Context) {
 	}
 }
 
-// payload is this side's handshake payload: its capabilities, plus the topic if
-// it is the opener (the joiner learns the topic from the opener's reply).
+// payload is this side's handshake payload. The opener has set a topic; the
+// joiner has not, so its (empty) topic is omitted and it learns the opener's.
 func (s *Session) payload() []byte {
-	p := parley.HandshakePayload{Capabilities: s.caps}
-	if s.role == opener {
-		p.Topic = s.topic
-	}
-	b, _ := json.Marshal(p)
+	b, _ := json.Marshal(parley.HandshakePayload{Topic: s.topic, Capabilities: s.caps})
 	return b
 }
 

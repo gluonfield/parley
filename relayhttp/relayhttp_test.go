@@ -144,6 +144,27 @@ func TestLongPollWakesOnFrame(t *testing.T) {
 	}
 }
 
+func TestIdleEviction(t *testing.T) {
+	s := NewServer()
+	secret, _ := parley.NewSecret()
+	stale, _ := parley.NewChannelID()
+	if _, err := s.open(stale, secret.JoinToken()); err != nil {
+		t.Fatal(err)
+	}
+	// Backdate the channel past the TTL; the next open should sweep it.
+	s.channels[stale].seen = time.Now().Add(-idleTTL - time.Minute)
+	fresh, _ := parley.NewChannelID()
+	if _, err := s.open(fresh, secret.JoinToken()); err != nil {
+		t.Fatal(err)
+	}
+	if _, ok := s.channels[stale]; ok {
+		t.Error("idle channel was not evicted")
+	}
+	if _, ok := s.channels[fresh]; !ok {
+		t.Error("fresh channel missing")
+	}
+}
+
 func TestAfterCursor(t *testing.T) {
 	c := newRelay(t)
 	ctx := context.Background()

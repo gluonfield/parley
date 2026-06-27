@@ -19,6 +19,11 @@ import (
 // client asks for a longer wait.
 const maxWait = 30 * time.Second
 
+// idleTTL bounds how long an idle channel is retained before eviction, so a
+// long-running relay does not accumulate dead channels (close is end-to-end, so
+// the relay never sees it directly).
+const idleTTL = 30 * time.Minute
+
 var (
 	errExists    = errors.New("channel already exists")
 	errNoChannel = errors.New("no such channel")
@@ -38,6 +43,7 @@ type channel struct {
 	expect parley.JoinToken
 	seats  [2]*seat
 	notify chan struct{} // closed and replaced when a frame is delivered
+	seen   time.Time     // last activity, for idle eviction
 }
 
 type seat struct {
@@ -53,20 +59,15 @@ func NewServer() *Server {
 // Handler mounts the relay's routes.
 func (s *Server) Handler() http.Handler {
 	mux := http.NewServeMux()
-	mux.HandleFunc("POST /c/{channel}", s.handleOpen)
-	mux.HandleFunc("POST /c/{channel}/join", s.handleJoin)
-	mux.HandleFunc("POST /c/{channel}/frames", s.handleSend)
-	mux.HandleFunc("GET /c/{channel}/frames", s.handleRecv)
-	mux.HandleFunc("GET /c/{channel}/members", s.handleMembers)
+	mux.HandleFunc("POST /c/{channel}", withChannel(s.handleOpen))
+	mux.HandleFunc("POST /c/{channel}/join", withChannel(s.handleJoin))
+	mux.HandleFunc("POST /c/{channel}/frames", withChannel(s.handleSend))
+	mux.HandleFunc("GET /c/{channel}/frames", withChannel(s.handleRecv))
+	mux.HandleFunc("GET /c/{channel}/members", withChannel(s.handleMembers))
 	return mux
 }
 
-func (s *Server) handleOpen(w http.ResponseWriter, r *http.Request) {
-	ch, ok := channelOf(r)
-	if !ok {
-		http.Error(w, "bad channel", http.StatusBadRequest)
-		return
-	}
+func (s *Server) handleOpen(w http.ResponseWriter, r *http.Request, ch parley.ChannelID) {
 	var req openRequest
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		http.Error(w, err.Error(), http.StatusBadRequest)
@@ -80,12 +81,7 @@ func (s *Server) handleOpen(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, tokenResponse{Token: token})
 }
 
-func (s *Server) handleJoin(w http.ResponseWriter, r *http.Request) {
-	ch, ok := channelOf(r)
-	if !ok {
-		http.Error(w, "bad channel", http.StatusBadRequest)
-		return
-	}
+func (s *Server) handleJoin(w http.ResponseWriter, r *http.Request, ch parley.ChannelID) {
 	var req joinRequest
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		http.Error(w, err.Error(), http.StatusBadRequest)
@@ -99,12 +95,7 @@ func (s *Server) handleJoin(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, tokenResponse{Token: token})
 }
 
-func (s *Server) handleSend(w http.ResponseWriter, r *http.Request) {
-	ch, ok := channelOf(r)
-	if !ok {
-		http.Error(w, "bad channel", http.StatusBadRequest)
-		return
-	}
+func (s *Server) handleSend(w http.ResponseWriter, r *http.Request, ch parley.ChannelID) {
 	var dto frameDTO
 	if err := json.NewDecoder(r.Body).Decode(&dto); err != nil {
 		http.Error(w, err.Error(), http.StatusBadRequest)
@@ -117,12 +108,7 @@ func (s *Server) handleSend(w http.ResponseWriter, r *http.Request) {
 	w.WriteHeader(http.StatusNoContent)
 }
 
-func (s *Server) handleRecv(w http.ResponseWriter, r *http.Request) {
-	ch, ok := channelOf(r)
-	if !ok {
-		http.Error(w, "bad channel", http.StatusBadRequest)
-		return
-	}
+func (s *Server) handleRecv(w http.ResponseWriter, r *http.Request, ch parley.ChannelID) {
 	after, _ := strconv.ParseUint(r.URL.Query().Get("after"), 10, 64)
 	waitMs, _ := strconv.ParseInt(r.URL.Query().Get("wait"), 10, 64)
 	frames, err := s.recv(r.Context(), ch, bearer(r), after, time.Duration(waitMs)*time.Millisecond)
@@ -137,12 +123,7 @@ func (s *Server) handleRecv(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, recvResponse{Frames: dtos})
 }
 
-func (s *Server) handleMembers(w http.ResponseWriter, r *http.Request) {
-	ch, ok := channelOf(r)
-	if !ok {
-		http.Error(w, "bad channel", http.StatusBadRequest)
-		return
-	}
+func (s *Server) handleMembers(w http.ResponseWriter, r *http.Request, ch parley.ChannelID) {
 	n, err := s.members(ch, bearer(r))
 	if err != nil {
 		writeError(w, err)
@@ -154,6 +135,7 @@ func (s *Server) handleMembers(w http.ResponseWriter, r *http.Request) {
 func (s *Server) open(ch parley.ChannelID, expect parley.JoinToken) (string, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	s.evictIdle()
 	if _, ok := s.channels[ch]; ok {
 		return "", errExists
 	}
@@ -162,6 +144,7 @@ func (s *Server) open(ch parley.ChannelID, expect parley.JoinToken) (string, err
 		expect: expect,
 		seats:  [2]*seat{{token: token}},
 		notify: make(chan struct{}),
+		seen:   time.Now(),
 	}
 	return token, nil
 }
@@ -178,6 +161,7 @@ func (s *Server) join(ch parley.ChannelID, present parley.JoinToken) (string, er
 	case subtle.ConstantTimeCompare([]byte(present), []byte(c.expect)) != 1:
 		return "", errBadToken
 	}
+	c.seen = time.Now()
 	token := mintToken()
 	c.seats[1] = &seat{token: token}
 	return token, nil
@@ -198,6 +182,7 @@ func (s *Server) send(ch parley.ChannelID, token string, f parley.Frame) error {
 	if peer == nil {
 		return errNoPeer
 	}
+	c.seen = time.Now()
 	peer.inbox = append(peer.inbox, f)
 	close(c.notify)
 	c.notify = make(chan struct{})
@@ -222,6 +207,7 @@ func (s *Server) recv(ctx context.Context, ch parley.ChannelID, token string, af
 			s.mu.Unlock()
 			return nil, errBadToken
 		}
+		c.seen = time.Now()
 		var out []parley.Frame
 		for _, f := range c.seats[i].inbox {
 			if f.Seq > after {
@@ -254,6 +240,7 @@ func (s *Server) members(ch parley.ChannelID, token string) (int, error) {
 	if seatOf(c, token) < 0 {
 		return 0, errBadToken
 	}
+	c.seen = time.Now()
 	n := 0
 	for _, st := range c.seats {
 		if st != nil {
@@ -261,6 +248,18 @@ func (s *Server) members(ch parley.ChannelID, token string) (int, error) {
 		}
 	}
 	return n, nil
+}
+
+// evictIdle drops channels with no activity for longer than idleTTL. The caller
+// must hold s.mu. It runs opportunistically on open, so a long-running relay
+// sheds dead channels without a background sweeper.
+func (s *Server) evictIdle() {
+	cutoff := time.Now().Add(-idleTTL)
+	for id, c := range s.channels {
+		if c.seen.Before(cutoff) {
+			delete(s.channels, id)
+		}
+	}
 }
 
 func seatOf(c *channel, token string) int {
@@ -276,6 +275,22 @@ func mintToken() string {
 	var b [32]byte
 	rand.Read(b[:])
 	return base64.RawURLEncoding.EncodeToString(b[:])
+}
+
+// channelFunc is an HTTP handler whose channel has already been parsed.
+type channelFunc func(http.ResponseWriter, *http.Request, parley.ChannelID)
+
+// withChannel parses the {channel} path value once and rejects a malformed one,
+// so the handlers need not each repeat it.
+func withChannel(fn channelFunc) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		ch, ok := channelOf(r)
+		if !ok {
+			http.Error(w, "bad channel", http.StatusBadRequest)
+			return
+		}
+		fn(w, r, ch)
+	}
 }
 
 func channelOf(r *http.Request) (parley.ChannelID, bool) {
