@@ -163,3 +163,68 @@ func TestPollNonBlocking(t *testing.T) {
 		t.Error("reported peer present with no joiner")
 	}
 }
+
+// rewindRelay is a malicious relay that ignores the cursor and replays every
+// frame from the start on each Recv.
+type rewindRelay struct{ parley.Relay }
+
+func (r rewindRelay) Recv(ctx context.Context, m parley.Membership, after uint64, wait time.Duration) ([]parley.Frame, error) {
+	return r.Relay.Recv(ctx, m, 0, wait)
+}
+
+// TestReplayGuard confirms the client surfaces each message exactly once even
+// when the relay replays the whole history on every poll.
+func TestReplayGuard(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	srv := httptest.NewServer(relayhttp.NewServer().Handler())
+	defer srv.Close()
+	relay := rewindRelay{relayhttp.NewClient(srv.URL)}
+
+	okp, _ := noise.GenerateKeypair()
+	jkp, _ := noise.GenerateKeypair()
+	opener := session.New(okp, relay, "parley.test")
+	joiner := session.New(jkp, relay, "parley.test")
+
+	invite, err := opener.Open(ctx, "replays")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := joiner.Join(ctx, invite); err != nil {
+		t.Fatal(err)
+	}
+	for _, m := range []string{"m1", "m2", "m3"} {
+		if err := joiner.Send(ctx, m); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	var got []string
+	for len(got) < 3 && ctx.Err() == nil {
+		if _, err := joiner.Poll(ctx, 200*time.Millisecond); err != nil {
+			t.Fatal(err)
+		}
+		msgs, err := opener.Poll(ctx, 200*time.Millisecond)
+		if err != nil {
+			t.Fatal(err)
+		}
+		for _, m := range msgs {
+			got = append(got, m.Text)
+		}
+	}
+	if want := []string{"m1", "m2", "m3"}; !equal(got, want) {
+		t.Fatalf("got %v, want %v (replays must be dropped)", got, want)
+	}
+}
+
+func equal(a, b []string) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	for i := range a {
+		if a[i] != b[i] {
+			return false
+		}
+	}
+	return true
+}

@@ -14,8 +14,8 @@ const Pattern = "Noise_IKpsk1_25519_ChaChaPoly_SHA256"
 // each side's [Capabilities] are authenticated by the handshake and cannot be
 // altered by the relay.
 type HandshakePayload struct {
-	Topic        string
-	Capabilities Capabilities
+	Topic        string       `json:"topic,omitempty"`
+	Capabilities Capabilities `json:"capabilities"`
 }
 
 // Capabilities is what a node will do on a channel, exchanged during the
@@ -25,7 +25,7 @@ type Capabilities struct {
 	// Push reports that the node can take turns delivered as they arrive rather
 	// than long-polling for them. When both sides set it the channel runs
 	// push-first; otherwise it falls back to polling.
-	Push bool
+	Push bool `json:"push,omitempty"`
 }
 
 // A Transport is the forward-secret channel a completed handshake produces. Each

@@ -172,11 +172,13 @@ func (s *Session) drive(ctx context.Context, wait time.Duration) ([]parley.Messa
 		if err != nil {
 			return out, err
 		}
-		if len(frames) == 0 {
-			return out, nil // nothing arrived within the window
-		}
-		s.recvSeq = frames[len(frames)-1].Seq
+		accepted := 0
 		for _, f := range frames {
+			if f.Seq <= s.recvSeq {
+				continue // ignore replays and rewinds; the relay is untrusted
+			}
+			s.recvSeq = f.Seq
+			accepted++
 			if s.tx == nil {
 				if err := s.advanceHandshake(ctx, f); err != nil {
 					return out, err
@@ -197,10 +199,10 @@ func (s *Session) drive(ctx context.Context, wait time.Duration) ([]parley.Messa
 				return out, err
 			}
 		}
-		if len(out) > 0 {
-			return out, nil
+		if len(out) > 0 || accepted == 0 {
+			return out, nil // got data, or nothing new (empty, or only replays)
 		}
-		// processed only handshake so far; keep waiting for data within the window
+		// accepted only handshake so far; keep waiting for data within the window
 	}
 }
 
@@ -281,6 +283,7 @@ func (s *Session) openMessage(f parley.Frame) (parley.Message, error) {
 	if err := m.UnmarshalBinary(pt); err != nil {
 		return parley.Message{}, err
 	}
+	m.From = s.peer.ID // attribution from authenticated context, not the wire
 	return m, nil
 }
 

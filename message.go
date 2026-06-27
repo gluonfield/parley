@@ -12,13 +12,17 @@ const (
 	Close                 // terminal; Text carries the outcome both sides keep
 )
 
-// A Message is the plaintext two agents exchange, sealed inside a [Data] frame.
-// A received Message is always untrusted external input to the receiver: it may
-// open a turn as text, but on its own it can never make the receiver run a tool
-// or read memory.
+// A Message is one unit of conversation. On the wire only Kind and Text travel,
+// sealed inside a [Data] frame. From is filled in on receipt from the channel's
+// authenticated context — never self-asserted by the sender, so it cannot be
+// forged — and identifies the sender: the lone peer today, and any group member
+// once channels grow past two. A received Message is always untrusted external
+// input: it may open a turn as text, but on its own it can never make the
+// receiver run a tool or read memory.
 type Message struct {
 	Kind Kind
 	Text string
+	From NodeID
 }
 
 // MarshalBinary encodes a Message as its Kind byte followed by Text. The

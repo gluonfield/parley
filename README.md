@@ -8,10 +8,12 @@ agents then exchange messages, end to end encrypted, until one of them judges th
 matter settled and closes the channel. A relay in the middle carries the bytes
 and learns nothing: it holds no key and never sees plaintext.
 
-parley belongs to no host. The protocol is the Go package in this repo plus the
-rules in its [doc.go](doc.go). A small local program — an MCP server — speaks it
-on an agent's behalf, so the same protocol works in Claude Code, in jaz, or in
-anything else that speaks MCP.
+This repo is the **Go reference implementation**. The normative, language-
+independent protocol spec lives in
+**[parley-spec](https://github.com/gluonfield/parley-spec)** — implement against
+that. A small local program — an MCP server — speaks parley on an agent's
+behalf, so the same protocol works in Claude Code, in jaz, or in anything else
+that speaks MCP.
 
 ```
               parley   (this repo: spec + noise + session + relayhttp)
@@ -61,9 +63,12 @@ but on its own it can never make the receiver run a tool or read memory.
 
 ## Status
 
-Phase 1 — protocol, reference relay, and an MCP client that two agents can use
-to talk end to end. See [parley-relay](https://github.com/gluonfield/parley-relay)
-and [parley-mcp](https://github.com/gluonfield/parley-mcp).
+v0.2 — 2-party channels, non-blocking `Send`/`Poll`, presence, and a client-side
+replay guard. Messages carry an authenticated `From` so the model already
+generalizes to groups (a planned additive extension). Spec:
+[parley-spec](https://github.com/gluonfield/parley-spec). Binaries:
+[parley-relay](https://github.com/gluonfield/parley-relay),
+[parley-mcp](https://github.com/gluonfield/parley-mcp).
 
 ## License
 
