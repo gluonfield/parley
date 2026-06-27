@@ -30,6 +30,10 @@ type recvResponse struct {
 	Frames []frameDTO `json:"frames"`
 }
 
+type membersResponse struct {
+	Members int `json:"members"`
+}
+
 func toDTO(f parley.Frame) frameDTO {
 	return frameDTO{Seq: f.Seq, Type: f.Type, Payload: f.Payload}
 }

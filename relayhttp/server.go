@@ -15,9 +15,9 @@ import (
 	"github.com/gluonfield/parley"
 )
 
-// pollTimeout bounds one long-poll. On expiry the server returns no frames and
-// the client re-polls, so connections never hang indefinitely.
-const pollTimeout = 25 * time.Second
+// maxWait caps one long-poll, so a connection never hangs indefinitely even if a
+// client asks for a longer wait.
+const maxWait = 30 * time.Second
 
 var (
 	errExists    = errors.New("channel already exists")
@@ -57,6 +57,7 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("POST /c/{channel}/join", s.handleJoin)
 	mux.HandleFunc("POST /c/{channel}/frames", s.handleSend)
 	mux.HandleFunc("GET /c/{channel}/frames", s.handleRecv)
+	mux.HandleFunc("GET /c/{channel}/members", s.handleMembers)
 	return mux
 }
 
@@ -123,7 +124,8 @@ func (s *Server) handleRecv(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	after, _ := strconv.ParseUint(r.URL.Query().Get("after"), 10, 64)
-	frames, err := s.recv(r.Context(), ch, bearer(r), after)
+	waitMs, _ := strconv.ParseInt(r.URL.Query().Get("wait"), 10, 64)
+	frames, err := s.recv(r.Context(), ch, bearer(r), after, time.Duration(waitMs)*time.Millisecond)
 	if err != nil {
 		writeError(w, err)
 		return
@@ -133,6 +135,20 @@ func (s *Server) handleRecv(w http.ResponseWriter, r *http.Request) {
 		dtos[i] = toDTO(f)
 	}
 	writeJSON(w, recvResponse{Frames: dtos})
+}
+
+func (s *Server) handleMembers(w http.ResponseWriter, r *http.Request) {
+	ch, ok := channelOf(r)
+	if !ok {
+		http.Error(w, "bad channel", http.StatusBadRequest)
+		return
+	}
+	n, err := s.members(ch, bearer(r))
+	if err != nil {
+		writeError(w, err)
+		return
+	}
+	writeJSON(w, membersResponse{Members: n})
 }
 
 func (s *Server) open(ch parley.ChannelID, expect parley.JoinToken) (string, error) {
@@ -188,8 +204,11 @@ func (s *Server) send(ch parley.ChannelID, token string, f parley.Frame) error {
 	return nil
 }
 
-func (s *Server) recv(ctx context.Context, ch parley.ChannelID, token string, after uint64) ([]parley.Frame, error) {
-	deadline := time.NewTimer(pollTimeout)
+func (s *Server) recv(ctx context.Context, ch parley.ChannelID, token string, after uint64, wait time.Duration) ([]parley.Frame, error) {
+	if wait > maxWait {
+		wait = maxWait
+	}
+	deadline := time.NewTimer(wait)
 	defer deadline.Stop()
 	for {
 		s.mu.Lock()
@@ -212,7 +231,7 @@ func (s *Server) recv(ctx context.Context, ch parley.ChannelID, token string, af
 		notify := c.notify
 		s.mu.Unlock()
 
-		if len(out) > 0 {
+		if len(out) > 0 || wait <= 0 {
 			return out, nil
 		}
 		select {
@@ -223,6 +242,25 @@ func (s *Server) recv(ctx context.Context, ch parley.ChannelID, token string, af
 			return nil, nil
 		}
 	}
+}
+
+func (s *Server) members(ch parley.ChannelID, token string) (int, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	c := s.channels[ch]
+	if c == nil {
+		return 0, errNoChannel
+	}
+	if seatOf(c, token) < 0 {
+		return 0, errBadToken
+	}
+	n := 0
+	for _, st := range c.seats {
+		if st != nil {
+			n++
+		}
+	}
+	return n, nil
 }
 
 func seatOf(c *channel, token string) int {

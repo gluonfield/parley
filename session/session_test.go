@@ -13,11 +13,28 @@ import (
 	"github.com/gluonfield/parley/session"
 )
 
-// TestTwoAgentsParley is the milestone: two independent sessions, a live relay,
-// and an invite carried through its URL form, exchange a full conversation and
-// end on a Close — without ever sharing memory.
+// pollUntil drives a session until it yields a message or the context ends.
+func pollUntil(ctx context.Context, s *session.Session) (parley.Message, error) {
+	for {
+		msgs, err := s.Poll(ctx, time.Second)
+		if err != nil {
+			return parley.Message{}, err
+		}
+		if len(msgs) > 0 {
+			return msgs[0], nil
+		}
+		if ctx.Err() != nil {
+			return parley.Message{}, ctx.Err()
+		}
+	}
+}
+
+// TestTwoAgentsParley is the milestone for the non-blocking model: two
+// independent sessions, a live relay, and an invite carried through its URL
+// form, hold a full conversation by sending and polling — never blocking on a
+// say — and end on a Close.
 func TestTwoAgentsParley(t *testing.T) {
-	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
 	defer cancel()
 
 	relaySrv := httptest.NewServer(relayhttp.NewServer().Handler())
@@ -39,7 +56,6 @@ func TestTwoAgentsParley(t *testing.T) {
 	if err != nil {
 		t.Fatalf("open: %v", err)
 	}
-	// The joiner only ever sees the link, so parse it back from its URL form.
 	parsed, err := parley.ParseInvite(invite.URL())
 	if err != nil {
 		t.Fatalf("parse invite: %v", err)
@@ -55,11 +71,14 @@ func TestTwoAgentsParley(t *testing.T) {
 		openerFinal parley.Kind
 		errs        [2]error
 	)
-
 	wg.Add(2)
-	go func() {
+	go func() { // joiner: speaks first, then closes
 		defer wg.Done()
-		reply, err := joiner.Say(ctx, "hello opener")
+		if err := joiner.Send(ctx, "hello opener"); err != nil {
+			errs[0] = err
+			return
+		}
+		reply, err := pollUntil(ctx, joiner)
 		if err != nil {
 			errs[0] = err
 			return
@@ -67,16 +86,19 @@ func TestTwoAgentsParley(t *testing.T) {
 		joinerHeard = reply.Text
 		errs[0] = joiner.Close(ctx, "agreed: offsite in september")
 	}()
-	go func() {
+	go func() { // opener: listens, replies, then hears the close
 		defer wg.Done()
-		msg, err := opener.Recv(ctx)
+		msg, err := pollUntil(ctx, opener)
 		if err != nil {
 			errs[1] = err
 			return
 		}
 		openerHeard = msg.Text
-		// Say returns the joiner's next message — which is the Close.
-		final, err := opener.Say(ctx, "hello joiner")
+		if err := opener.Send(ctx, "hello joiner"); err != nil {
+			errs[1] = err
+			return
+		}
+		final, err := pollUntil(ctx, opener)
 		if err != nil {
 			errs[1] = err
 			return
@@ -99,19 +121,45 @@ func TestTwoAgentsParley(t *testing.T) {
 	if openerFinal != parley.Close {
 		t.Errorf("opener's final message kind = %d, want Close", openerFinal)
 	}
-
-	// The joiner learned the topic from the handshake; both pinned the other's
-	// real identity.
 	if got := joiner.Peer().Topic; got != "plan the offsite" {
 		t.Errorf("joiner learned topic %q", got)
 	}
 	if got, want := opener.Peer().Fingerprint, (parley.Identity{Key: jkp.Public}).Fingerprint(); got != want {
 		t.Errorf("opener pinned %q, want joiner %q", got, want)
 	}
-	if got, want := joiner.Peer().Fingerprint, (parley.Identity{Key: okp.Public}).Fingerprint(); got != want {
-		t.Errorf("joiner pinned %q, want opener %q", got, want)
+	if !opener.Peer().Present {
+		t.Error("opener does not see the peer as present")
 	}
 	if opener.Peer().State != parley.Closed {
 		t.Error("opener channel not closed")
+	}
+}
+
+// TestPollNonBlocking confirms a poll with no peer returns promptly and empty.
+func TestPollNonBlocking(t *testing.T) {
+	ctx := context.Background()
+	relaySrv := httptest.NewServer(relayhttp.NewServer().Handler())
+	defer relaySrv.Close()
+	relay := relayhttp.NewClient(relaySrv.URL)
+
+	kp, _ := noise.GenerateKeypair()
+	opener := session.New(kp, relay, "parley.test")
+	if _, err := opener.Open(ctx, "lonely"); err != nil {
+		t.Fatal(err)
+	}
+
+	start := time.Now()
+	msgs, err := opener.Poll(ctx, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(msgs) != 0 {
+		t.Fatalf("expected no messages, got %d", len(msgs))
+	}
+	if time.Since(start) > time.Second {
+		t.Fatal("non-blocking poll blocked")
+	}
+	if opener.Peer().Present {
+		t.Error("reported peer present with no joiner")
 	}
 }

@@ -25,10 +25,12 @@
 //
 // The opener calls [Session.Open] and gets an [Invite]. A human carries the
 // invite to the joiner, whose agent calls [Session.Join]. The two complete a
-// Noise handshake and the channel becomes [Active]. Each turn is a
-// [Session.Say]: it sends a [Message] and blocks until the peer answers, so the
-// floor passes back and forth one turn at a time. Either side ends the exchange
-// with [Session.Close], the channel's only clean terminal state.
+// Noise handshake and the channel becomes [Active]. From there each side
+// [Session.Send]s messages and [Session.Poll]s for the peer's, both without
+// blocking: Send returns at once and Poll waits only as long as it is told, so
+// the two agents move at independent tempos rather than one freezing while the
+// other's owner thinks. Either side ends the exchange with [Session.Close], the
+// channel's only clean terminal state.
 //
 // # Identity and trust
 //
@@ -80,7 +82,8 @@
 //	POST /c/{channel}            open a channel, register the expected join token
 //	POST /c/{channel}/join       claim the second seat with the join token
 //	POST /c/{channel}/frames     send a frame
-//	GET  /c/{channel}/frames     long-poll for frames after a cursor
+//	GET  /c/{channel}/frames     poll for frames after a cursor, waiting up to ?wait ms
+//	GET  /c/{channel}/members    how many seats are occupied (presence)
 //
 // A channel seats exactly two; the relay refuses a third. It checks the
 // [JoinToken] — derived from the invite [Secret] by a one-way function — in

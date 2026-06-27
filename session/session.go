@@ -1,7 +1,12 @@
 // Package session is parley's reference client engine. A Session is one end of
 // one channel; it drives the handshake, seals and opens messages, and runs the
-// turn loop the spec describes — Say sends and waits, Close ends — over any
-// [parley.Relay]. It implements [parley.Session].
+// non-blocking model the spec describes — Send posts and returns, Poll collects
+// what has arrived — over any [parley.Relay]. It implements [parley.Session].
+//
+// A Session expects one call in flight at a time (the natural shape for an MCP
+// host, which dispatches tools sequentially). Send and Poll from separate
+// goroutines on the same Session are not supported; two different Sessions are
+// fully independent.
 package session
 
 import (
@@ -10,6 +15,7 @@ import (
 	"fmt"
 	"strconv"
 	"sync"
+	"time"
 
 	"github.com/gluonfield/parley"
 	"github.com/gluonfield/parley/noise"
@@ -33,16 +39,14 @@ type Session struct {
 	role     role
 	channel  parley.ChannelID
 	member   parley.Membership
-	psk      []byte
-	prologue []byte
 	topic    string
-
-	hs      *noise.Handshake
-	tx      parley.Transport
-	sendSeq uint64
-	recvSeq uint64
-	inbuf   []parley.Frame
-	peer    parley.Peer
+	hs       *noise.Handshake
+	tx       parley.Transport
+	sendSeq  uint64
+	recvSeq  uint64
+	pending  []string // sends queued before the channel went live
+	peer     parley.Peer
+	sentDone bool
 }
 
 var _ parley.Session = (*Session)(nil)
@@ -101,10 +105,9 @@ func (s *Session) Join(ctx context.Context, in parley.Invite) error {
 	s.channel = in.Channel
 	s.member = member
 	s.hs = hs
-	s.peer = parley.Peer{ID: id.ID(), Fingerprint: id.Fingerprint(), State: parley.Pending}
+	s.peer = parley.Peer{ID: id.ID(), Fingerprint: id.Fingerprint(), State: parley.Pending, Present: true}
 
-	// Send the first handshake message now, so the opener can advance the moment
-	// it next listens.
+	// Send the first handshake message now; the opener completes it on its first Poll.
 	msg, err := s.hs.Write(s.payload())
 	if err != nil {
 		return err
@@ -112,36 +115,37 @@ func (s *Session) Join(ctx context.Context, in parley.Invite) error {
 	return s.sendFrame(ctx, parley.Handshake, msg)
 }
 
-func (s *Session) Say(ctx context.Context, text string) (parley.Message, error) {
+func (s *Session) Send(ctx context.Context, text string) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	if err := s.ensureActive(ctx); err != nil {
-		return parley.Message{}, err
+	if s.sentDone {
+		return fmt.Errorf("parley/session: channel closed")
 	}
-	if err := s.sendMessage(ctx, parley.Message{Kind: parley.Say, Text: text}); err != nil {
-		return parley.Message{}, err
+	if s.tx == nil {
+		s.pending = append(s.pending, text) // flushed once the handshake completes
+		return nil
 	}
-	return s.receive(ctx)
+	return s.sendMessage(ctx, parley.Message{Kind: parley.Say, Text: text})
 }
 
-func (s *Session) Recv(ctx context.Context) (parley.Message, error) {
+func (s *Session) Poll(ctx context.Context, wait time.Duration) ([]parley.Message, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	if err := s.ensureActive(ctx); err != nil {
-		return parley.Message{}, err
-	}
-	return s.receive(ctx)
+	return s.drive(ctx, wait)
 }
 
 func (s *Session) Close(ctx context.Context, outcome string) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	if err := s.ensureActive(ctx); err != nil {
-		return err
+	if s.sentDone {
+		return nil
 	}
-	if err := s.sendMessage(ctx, parley.Message{Kind: parley.Close, Text: outcome}); err != nil {
-		return err
+	if s.tx != nil {
+		if err := s.sendMessage(ctx, parley.Message{Kind: parley.Close, Text: outcome}); err != nil {
+			return err
+		}
 	}
+	s.sentDone = true
 	s.peer.State = parley.Closed
 	return nil
 }
@@ -152,50 +156,95 @@ func (s *Session) Peer() parley.Peer {
 	return s.peer
 }
 
-// ensureActive completes the handshake on first use. The joiner has already sent
-// its message in Join and only needs the opener's reply; the opener reads the
-// joiner's message and sends its own.
-func (s *Session) ensureActive(ctx context.Context) error {
-	if s.tx != nil {
-		return nil
+// drive advances the channel: it refreshes presence, completes the handshake,
+// flushes queued sends, and returns any messages, waiting up to wait for the
+// first. Handshake frames are processed transparently; only data surfaces.
+func (s *Session) drive(ctx context.Context, wait time.Duration) ([]parley.Message, error) {
+	s.refreshPresence(ctx)
+	deadline := time.Now().Add(wait)
+	var out []parley.Message
+	for {
+		w := time.Until(deadline)
+		if w < 0 {
+			w = 0
+		}
+		frames, err := s.relay.Recv(ctx, s.member, s.recvSeq, w)
+		if err != nil {
+			return out, err
+		}
+		if len(frames) == 0 {
+			return out, nil // nothing arrived within the window
+		}
+		s.recvSeq = frames[len(frames)-1].Seq
+		for _, f := range frames {
+			if s.tx == nil {
+				if err := s.advanceHandshake(ctx, f); err != nil {
+					return out, err
+				}
+				continue
+			}
+			m, err := s.openMessage(f)
+			if err != nil {
+				return out, err
+			}
+			out = append(out, m)
+			if m.Kind == parley.Close {
+				s.peer.State = parley.Closed
+			}
+		}
+		if s.tx != nil {
+			if err := s.flush(ctx); err != nil {
+				return out, err
+			}
+		}
+		if len(out) > 0 {
+			return out, nil
+		}
+		// processed only handshake so far; keep waiting for data within the window
 	}
-	switch s.role {
-	case joiner:
-		f, err := s.recvFrame(ctx)
-		if err != nil {
-			return err
-		}
-		got, err := s.hs.Read(f.Payload)
-		if err != nil {
-			return fmt.Errorf("parley/session: handshake: %w", err)
-		}
-		s.learn(got)
-	case opener:
-		f, err := s.recvFrame(ctx)
-		if err != nil {
-			return err
-		}
-		got, err := s.hs.Read(f.Payload)
-		if err != nil {
-			return fmt.Errorf("parley/session: handshake: %w", err)
-		}
-		s.learn(got)
+}
+
+func (s *Session) advanceHandshake(ctx context.Context, f parley.Frame) error {
+	if f.Type != parley.Handshake {
+		return fmt.Errorf("parley/session: expected handshake, got %d frame", f.Type)
+	}
+	got, err := s.hs.Read(f.Payload)
+	if err != nil {
+		return fmt.Errorf("parley/session: handshake: %w", err)
+	}
+	s.learn(got)
+	if s.role == opener && !s.hs.Done() {
 		msg, err := s.hs.Write(s.payload())
 		if err != nil {
-			return err
+			return fmt.Errorf("parley/session: handshake: %w", err)
 		}
 		if err := s.sendFrame(ctx, parley.Handshake, msg); err != nil {
 			return err
 		}
-		id := parley.Identity{Key: s.hs.PeerStatic()}
-		s.peer.ID, s.peer.Fingerprint = id.ID(), id.Fingerprint()
 	}
-	tx, err := s.hs.Transport()
-	if err != nil {
-		return err
+	if s.hs.Done() {
+		tx, err := s.hs.Transport()
+		if err != nil {
+			return err
+		}
+		s.tx = tx
+		s.peer.State = parley.Active
+		s.peer.Present = true
+		if s.role == opener {
+			id := parley.Identity{Key: s.hs.PeerStatic()}
+			s.peer.ID, s.peer.Fingerprint = id.ID(), id.Fingerprint()
+		}
 	}
-	s.tx = tx
-	s.peer.State = parley.Active
+	return nil
+}
+
+func (s *Session) flush(ctx context.Context) error {
+	for len(s.pending) > 0 {
+		if err := s.sendMessage(ctx, parley.Message{Kind: parley.Say, Text: s.pending[0]}); err != nil {
+			return err
+		}
+		s.pending = s.pending[1:]
+	}
 	return nil
 }
 
@@ -211,11 +260,16 @@ func (s *Session) sendMessage(ctx context.Context, m parley.Message) error {
 	return s.sendFrame(ctx, parley.Data, ct)
 }
 
-func (s *Session) receive(ctx context.Context) (parley.Message, error) {
-	f, err := s.recvFrame(ctx)
-	if err != nil {
-		return parley.Message{}, err
+func (s *Session) sendFrame(ctx context.Context, typ parley.FrameType, payload []byte) error {
+	f := parley.Frame{Channel: s.channel, Seq: s.sendSeq, Type: typ, Payload: payload}
+	if err := s.relay.Send(ctx, s.member, f); err != nil {
+		return fmt.Errorf("parley/session: send: %w", err)
 	}
+	s.sendSeq++
+	return nil
+}
+
+func (s *Session) openMessage(f parley.Frame) (parley.Message, error) {
 	if f.Type != parley.Data {
 		return parley.Message{}, fmt.Errorf("parley/session: expected data, got %d frame", f.Type)
 	}
@@ -227,35 +281,17 @@ func (s *Session) receive(ctx context.Context) (parley.Message, error) {
 	if err := m.UnmarshalBinary(pt); err != nil {
 		return parley.Message{}, err
 	}
-	if m.Kind == parley.Close {
-		s.peer.State = parley.Closed
-	}
 	return m, nil
 }
 
-func (s *Session) sendFrame(ctx context.Context, typ parley.FrameType, payload []byte) error {
-	f := parley.Frame{Channel: s.channel, Seq: s.sendSeq, Type: typ, Payload: payload}
-	if err := s.relay.Send(ctx, s.member, f); err != nil {
-		return fmt.Errorf("parley/session: send: %w", err)
+func (s *Session) refreshPresence(ctx context.Context) {
+	if s.peer.State == parley.Active || s.peer.State == parley.Closed {
+		s.peer.Present = true
+		return
 	}
-	s.sendSeq++
-	return nil
-}
-
-func (s *Session) recvFrame(ctx context.Context) (parley.Frame, error) {
-	for len(s.inbuf) == 0 {
-		frames, err := s.relay.Recv(ctx, s.member, s.recvSeq)
-		if err != nil {
-			return parley.Frame{}, fmt.Errorf("parley/session: recv: %w", err)
-		}
-		s.inbuf = append(s.inbuf, frames...)
-		if n := len(frames); n > 0 {
-			s.recvSeq = frames[n-1].Seq
-		}
+	if n, err := s.relay.Members(ctx, s.member); err == nil {
+		s.peer.Present = n >= 2
 	}
-	f := s.inbuf[0]
-	s.inbuf = s.inbuf[1:]
-	return f, nil
 }
 
 // payload is this side's handshake payload: its capabilities, plus the topic if

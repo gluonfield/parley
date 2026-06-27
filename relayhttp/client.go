@@ -7,8 +7,8 @@ import (
 	"fmt"
 	"io"
 	"net/http"
-	"strconv"
 	"strings"
+	"time"
 
 	"github.com/gluonfield/parley"
 )
@@ -42,26 +42,27 @@ func (c *Client) Send(ctx context.Context, m parley.Membership, f parley.Frame) 
 	return c.do(ctx, http.MethodPost, c.channelURL(m.Channel)+"/frames", m.Token, toDTO(f), nil)
 }
 
-// Recv long-polls until at least one frame is available, the context ends, or
-// the relay reports the channel gone. Empty poll responses are retried.
-func (c *Client) Recv(ctx context.Context, m parley.Membership, after uint64) ([]parley.Frame, error) {
-	url := c.channelURL(m.Channel) + "/frames?after=" + strconv.FormatUint(after, 10)
-	for {
-		var resp recvResponse
-		if err := c.do(ctx, http.MethodGet, url, m.Token, nil, &resp); err != nil {
-			return nil, err
-		}
-		if len(resp.Frames) > 0 {
-			out := make([]parley.Frame, len(resp.Frames))
-			for i, d := range resp.Frames {
-				out[i] = d.frame(m.Channel)
-			}
-			return out, nil
-		}
-		if err := ctx.Err(); err != nil {
-			return nil, err
-		}
+// Recv polls once, waiting up to wait for at least one frame, and returns
+// whatever is available (possibly nothing). Callers that want to block for a
+// message loop over this themselves.
+func (c *Client) Recv(ctx context.Context, m parley.Membership, after uint64, wait time.Duration) ([]parley.Frame, error) {
+	url := fmt.Sprintf("%s/frames?after=%d&wait=%d", c.channelURL(m.Channel), after, wait.Milliseconds())
+	var resp recvResponse
+	if err := c.do(ctx, http.MethodGet, url, m.Token, nil, &resp); err != nil {
+		return nil, err
 	}
+	out := make([]parley.Frame, len(resp.Frames))
+	for i, d := range resp.Frames {
+		out[i] = d.frame(m.Channel)
+	}
+	return out, nil
+}
+
+// Members reports how many of the channel's two seats are occupied.
+func (c *Client) Members(ctx context.Context, m parley.Membership) (int, error) {
+	var resp membersResponse
+	err := c.do(ctx, http.MethodGet, c.channelURL(m.Channel)+"/members", m.Token, nil, &resp)
+	return resp.Members, err
 }
 
 func (c *Client) channelURL(ch parley.ChannelID) string {
