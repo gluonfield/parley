@@ -9,7 +9,9 @@
 package noise
 
 import (
+	"bytes"
 	"crypto/rand"
+	"crypto/sha256"
 	"fmt"
 
 	"github.com/flynn/noise"
@@ -35,6 +37,27 @@ func GenerateKeypair() (Keypair, error) {
 	dh, err := suite.GenerateKeypair(rand.Reader)
 	if err != nil {
 		return Keypair{}, fmt.Errorf("parley/noise: generate keypair: %w", err)
+	}
+	kp := Keypair{Private: dh.Private}
+	copy(kp.Public[:], dh.Public)
+	return kp, nil
+}
+
+// DeriveKeypair deterministically derives a static keypair from high-entropy
+// secret seed material. It is for hosted node processes that intentionally keep
+// no at-rest key store; callers must not feed it usernames or other guessable
+// identifiers.
+func DeriveKeypair(seed []byte) (Keypair, error) {
+	if len(seed) == 0 {
+		return Keypair{}, fmt.Errorf("parley/noise: derive keypair: empty seed")
+	}
+	h := sha256.New()
+	h.Write([]byte("parley:identity-key:v1\x00"))
+	h.Write(seed)
+	sum := h.Sum(nil)
+	dh, err := suite.GenerateKeypair(bytes.NewReader(sum))
+	if err != nil {
+		return Keypair{}, fmt.Errorf("parley/noise: derive keypair: %w", err)
 	}
 	kp := Keypair{Private: dh.Private}
 	copy(kp.Public[:], dh.Public)

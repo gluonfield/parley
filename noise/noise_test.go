@@ -7,6 +7,43 @@ import (
 	"github.com/gluonfield/parley"
 )
 
+func TestDeriveKeypair(t *testing.T) {
+	seed := []byte("0123456789abcdef0123456789abcdef")
+	a, err := DeriveKeypair(seed)
+	if err != nil {
+		t.Fatal(err)
+	}
+	b, err := DeriveKeypair(seed)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(a.Private, b.Private) {
+		t.Fatal("same seed derived different private keys")
+	}
+	if a.Public != b.Public {
+		t.Fatal("same seed derived different public keys")
+	}
+
+	c, err := DeriveKeypair([]byte("fedcba9876543210fedcba9876543210"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if a.Public == c.Public {
+		t.Fatal("different seeds derived the same public key")
+	}
+	aID := parley.Identity{Key: a.Public}.ID()
+	cID := parley.Identity{Key: c.Public}.ID()
+	if aID == cID {
+		t.Fatal("different seeds derived the same node id")
+	}
+}
+
+func TestDeriveKeypairEmptySeed(t *testing.T) {
+	if _, err := DeriveKeypair(nil); err == nil {
+		t.Fatal("empty seed accepted")
+	}
+}
+
 // run drives a full IKpsk1 exchange between a joiner (initiator) and an opener
 // (responder) and returns their transports.
 func run(t *testing.T, joinerPSK, openerPSK, prologue []byte) (parley.Transport, parley.Transport, error) {
