@@ -3,6 +3,7 @@ package relayhttp
 import (
 	"context"
 	"net/http/httptest"
+	"sync"
 	"testing"
 	"time"
 
@@ -144,24 +145,62 @@ func TestLongPollWakesOnFrame(t *testing.T) {
 	}
 }
 
-func TestIdleEviction(t *testing.T) {
-	s := NewServer()
+func TestPurgeDropsIdleChannels(t *testing.T) {
+	m := newMemStore()
 	secret, _ := parley.NewSecret()
 	stale, _ := parley.NewChannelID()
-	if _, err := s.open(stale, secret.JoinToken()); err != nil {
+	if err := m.Open(context.Background(), stale, secret.JoinToken(), "stale-token"); err != nil {
 		t.Fatal(err)
 	}
-	// Backdate the channel past the TTL; the next open should sweep it.
-	s.channels[stale].seen = time.Now().Add(-idleTTL - time.Minute)
+	m.channels[stale].seen = time.Now().Add(-time.Hour)
 	fresh, _ := parley.NewChannelID()
-	if _, err := s.open(fresh, secret.JoinToken()); err != nil {
+	if err := m.Open(context.Background(), fresh, secret.JoinToken(), "fresh-token"); err != nil {
 		t.Fatal(err)
 	}
-	if _, ok := s.channels[stale]; ok {
-		t.Error("idle channel was not evicted")
+	if err := m.Purge(context.Background(), time.Now().Add(-time.Minute)); err != nil {
+		t.Fatal(err)
 	}
-	if _, ok := s.channels[fresh]; !ok {
+	if _, ok := m.channels[stale]; ok {
+		t.Error("idle channel was not purged")
+	}
+	if _, ok := m.channels[fresh]; !ok {
 		t.Error("fresh channel missing")
+	}
+}
+
+// countingStore proves the relay drives whatever Store it is given: a deployment
+// can swap in a durable backend without changing the HTTP or wire layers.
+type countingStore struct {
+	Store
+	mu      sync.Mutex
+	appends int
+}
+
+func (c *countingStore) Append(ctx context.Context, ch parley.ChannelID, from string, f parley.Frame) error {
+	c.mu.Lock()
+	c.appends++
+	c.mu.Unlock()
+	return c.Store.Append(ctx, ch, from, f)
+}
+
+func TestServerUsesInjectedStore(t *testing.T) {
+	cs := &countingStore{Store: newMemStore()}
+	srv := httptest.NewServer(NewServerWithStore(cs).Handler())
+	t.Cleanup(srv.Close)
+	c := NewClient(srv.URL)
+	ctx := context.Background()
+	ch, secret, _ := opened(t, c)
+	joiner, err := c.Join(ctx, ch, secret.JoinToken())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := c.Send(ctx, joiner, data(ch, 1, "hi")); err != nil {
+		t.Fatal(err)
+	}
+	cs.mu.Lock()
+	defer cs.mu.Unlock()
+	if cs.appends != 1 {
+		t.Fatalf("injected store not used: appends=%d", cs.appends)
 	}
 }
 

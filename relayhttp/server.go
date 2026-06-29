@@ -3,7 +3,6 @@ package relayhttp
 import (
 	"context"
 	"crypto/rand"
-	"crypto/subtle"
 	"encoding/base64"
 	"encoding/json"
 	"errors"
@@ -15,45 +14,52 @@ import (
 	"github.com/gluonfield/parley"
 )
 
-// maxWait caps one long-poll, so a connection never hangs indefinitely even if a
-// client asks for a longer wait.
-const maxWait = 30 * time.Second
+const (
+	// maxWait caps one long-poll, so a connection never hangs indefinitely even
+	// if a client asks for a longer wait.
+	maxWait = 30 * time.Second
 
-// idleTTL bounds how long an idle channel is retained before eviction, so a
-// long-running relay does not accumulate dead channels (close is end-to-end, so
-// the relay never sees it directly).
-const idleTTL = 30 * time.Minute
+	// pollInterval re-checks the store during a long-poll, so frames appended by
+	// another relay instance against a shared durable store are seen promptly
+	// even without an in-process signal.
+	pollInterval = time.Second
 
-var (
-	errExists    = errors.New("channel already exists")
-	errNoChannel = errors.New("no such channel")
-	errFull      = errors.New("channel is full")
-	errBadToken  = errors.New("unrecognized token")
-	errNoPeer    = errors.New("peer has not joined")
+	// defaultRetention bounds how long an idle channel is kept. It is long enough
+	// that a sealed frame survives until an offline peer next polls; back it with
+	// a durable Store to also survive a relay restart.
+	defaultRetention = 7 * 24 * time.Hour
 )
 
-// A Server is the relay's HTTP surface over an in-memory store. The zero value
-// is not usable; construct it with [NewServer].
+// A Server is the relay's HTTP surface over a [Store]. It owns the wire format,
+// membership-token minting, the long-poll wait, and retention policy; the Store
+// owns where channel state lives. [NewServer] backs it with an in-memory store.
 type Server struct {
-	mu       sync.Mutex
-	channels map[parley.ChannelID]*channel
+	store     Store
+	notify    *notifier
+	retention time.Duration
 }
 
-type channel struct {
-	expect parley.JoinToken
-	seats  [2]*seat
-	notify chan struct{} // closed and replaced when a frame is delivered
-	seen   time.Time     // last activity, for idle eviction
+// An Option configures a [Server].
+type Option func(*Server)
+
+// WithRetention sets how long an idle channel is kept before purge. Longer
+// retention lets an offline peer collect a sealed frame after more downtime;
+// pair it with a durable [Store] to also survive a relay restart.
+func WithRetention(d time.Duration) Option {
+	return func(s *Server) { s.retention = d }
 }
 
-type seat struct {
-	token string
-	inbox []parley.Frame
-}
+// NewServer returns a relay backed by the default in-memory store.
+func NewServer(opts ...Option) *Server { return NewServerWithStore(newMemStore(), opts...) }
 
-// NewServer returns an empty relay.
-func NewServer() *Server {
-	return &Server{channels: make(map[parley.ChannelID]*channel)}
+// NewServerWithStore returns a relay backed by store, letting a deployment swap
+// in durable storage (Redis, SQL, …) without touching the HTTP or wire layers.
+func NewServerWithStore(store Store, opts ...Option) *Server {
+	s := &Server{store: store, notify: newNotifier(), retention: defaultRetention}
+	for _, opt := range opts {
+		opt(s)
+	}
+	return s
 }
 
 // Handler mounts the relay's routes.
@@ -73,8 +79,9 @@ func (s *Server) handleOpen(w http.ResponseWriter, r *http.Request, ch parley.Ch
 		http.Error(w, err.Error(), http.StatusBadRequest)
 		return
 	}
-	token, err := s.open(ch, req.Expect)
-	if err != nil {
+	s.store.Purge(r.Context(), time.Now().Add(-s.retention))
+	token := mintToken()
+	if err := s.store.Open(r.Context(), ch, req.Expect, token); err != nil {
 		writeError(w, err)
 		return
 	}
@@ -87,8 +94,8 @@ func (s *Server) handleJoin(w http.ResponseWriter, r *http.Request, ch parley.Ch
 		http.Error(w, err.Error(), http.StatusBadRequest)
 		return
 	}
-	token, err := s.join(ch, req.Token)
-	if err != nil {
+	token := mintToken()
+	if err := s.store.Join(r.Context(), ch, req.Token, token); err != nil {
 		writeError(w, err)
 		return
 	}
@@ -101,10 +108,11 @@ func (s *Server) handleSend(w http.ResponseWriter, r *http.Request, ch parley.Ch
 		http.Error(w, err.Error(), http.StatusBadRequest)
 		return
 	}
-	if err := s.send(ch, bearer(r), dto.frame(ch)); err != nil {
+	if err := s.store.Append(r.Context(), ch, bearer(r), dto.frame(ch)); err != nil {
 		writeError(w, err)
 		return
 	}
+	s.notify.signal(ch)
 	w.WriteHeader(http.StatusNoContent)
 }
 
@@ -124,7 +132,7 @@ func (s *Server) handleRecv(w http.ResponseWriter, r *http.Request, ch parley.Ch
 }
 
 func (s *Server) handleMembers(w http.ResponseWriter, r *http.Request, ch parley.ChannelID) {
-	n, err := s.members(ch, bearer(r))
+	n, err := s.store.Members(r.Context(), ch, bearer(r))
 	if err != nil {
 		writeError(w, err)
 		return
@@ -132,63 +140,10 @@ func (s *Server) handleMembers(w http.ResponseWriter, r *http.Request, ch parley
 	writeJSON(w, membersResponse{Members: n})
 }
 
-func (s *Server) open(ch parley.ChannelID, expect parley.JoinToken) (string, error) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	s.evictIdle()
-	if _, ok := s.channels[ch]; ok {
-		return "", errExists
-	}
-	token := mintToken()
-	s.channels[ch] = &channel{
-		expect: expect,
-		seats:  [2]*seat{{token: token}},
-		notify: make(chan struct{}),
-		seen:   time.Now(),
-	}
-	return token, nil
-}
-
-func (s *Server) join(ch parley.ChannelID, present parley.JoinToken) (string, error) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	c := s.channels[ch]
-	switch {
-	case c == nil:
-		return "", errNoChannel
-	case c.seats[1] != nil:
-		return "", errFull
-	case subtle.ConstantTimeCompare([]byte(present), []byte(c.expect)) != 1:
-		return "", errBadToken
-	}
-	c.seen = time.Now()
-	token := mintToken()
-	c.seats[1] = &seat{token: token}
-	return token, nil
-}
-
-func (s *Server) send(ch parley.ChannelID, token string, f parley.Frame) error {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	c := s.channels[ch]
-	if c == nil {
-		return errNoChannel
-	}
-	i := seatOf(c, token)
-	if i < 0 {
-		return errBadToken
-	}
-	peer := c.seats[1-i]
-	if peer == nil {
-		return errNoPeer
-	}
-	c.seen = time.Now()
-	peer.inbox = append(peer.inbox, f)
-	close(c.notify)
-	c.notify = make(chan struct{})
-	return nil
-}
-
+// recv long-polls the store: it returns as soon as the seat has frames after the
+// cursor, and otherwise waits up to wait for a signal, a periodic re-check, or
+// the deadline. Subscribing to the notify channel before reading the store
+// closes the gap where a frame could land between the read and the wait.
 func (s *Server) recv(ctx context.Context, ch parley.ChannelID, token string, after uint64, wait time.Duration) ([]parley.Frame, error) {
 	if wait > maxWait {
 		wait = maxWait
@@ -196,32 +151,17 @@ func (s *Server) recv(ctx context.Context, ch parley.ChannelID, token string, af
 	deadline := time.NewTimer(wait)
 	defer deadline.Stop()
 	for {
-		s.mu.Lock()
-		c := s.channels[ch]
-		if c == nil {
-			s.mu.Unlock()
-			return nil, errNoChannel
+		ready := s.notify.wait(ch)
+		frames, err := s.store.Frames(ctx, ch, token, after)
+		if err != nil {
+			return nil, err
 		}
-		i := seatOf(c, token)
-		if i < 0 {
-			s.mu.Unlock()
-			return nil, errBadToken
-		}
-		c.seen = time.Now()
-		var out []parley.Frame
-		for _, f := range c.seats[i].inbox {
-			if f.Seq > after {
-				out = append(out, f)
-			}
-		}
-		notify := c.notify
-		s.mu.Unlock()
-
-		if len(out) > 0 || wait <= 0 {
-			return out, nil
+		if len(frames) > 0 || wait <= 0 {
+			return frames, nil
 		}
 		select {
-		case <-notify:
+		case <-ready:
+		case <-time.After(pollInterval):
 		case <-ctx.Done():
 			return nil, ctx.Err()
 		case <-deadline.C:
@@ -230,51 +170,43 @@ func (s *Server) recv(ctx context.Context, ch parley.ChannelID, token string, af
 	}
 }
 
-func (s *Server) members(ch parley.ChannelID, token string) (int, error) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	c := s.channels[ch]
-	if c == nil {
-		return 0, errNoChannel
-	}
-	if seatOf(c, token) < 0 {
-		return 0, errBadToken
-	}
-	c.seen = time.Now()
-	n := 0
-	for _, st := range c.seats {
-		if st != nil {
-			n++
-		}
-	}
-	return n, nil
-}
-
-// evictIdle drops channels with no activity for longer than idleTTL. The caller
-// must hold s.mu. It runs opportunistically on open, so a long-running relay
-// sheds dead channels without a background sweeper.
-func (s *Server) evictIdle() {
-	cutoff := time.Now().Add(-idleTTL)
-	for id, c := range s.channels {
-		if c.seen.Before(cutoff) {
-			delete(s.channels, id)
-		}
-	}
-}
-
-func seatOf(c *channel, token string) int {
-	for i, st := range c.seats {
-		if st != nil && subtle.ConstantTimeCompare([]byte(st.token), []byte(token)) == 1 {
-			return i
-		}
-	}
-	return -1
-}
-
 func mintToken() string {
 	var b [32]byte
 	rand.Read(b[:])
 	return base64.RawURLEncoding.EncodeToString(b[:])
+}
+
+// notifier wakes long-polling readers on a channel when a frame is appended to
+// it on this relay instance. It is in-process coordination only — a reader
+// against a shared durable store also re-checks on pollInterval — so it carries
+// no state a restart could lose.
+type notifier struct {
+	mu    sync.Mutex
+	chans map[parley.ChannelID]chan struct{}
+}
+
+func newNotifier() *notifier {
+	return &notifier{chans: make(map[parley.ChannelID]chan struct{})}
+}
+
+func (n *notifier) wait(ch parley.ChannelID) <-chan struct{} {
+	n.mu.Lock()
+	defer n.mu.Unlock()
+	c, ok := n.chans[ch]
+	if !ok {
+		c = make(chan struct{})
+		n.chans[ch] = c
+	}
+	return c
+}
+
+func (n *notifier) signal(ch parley.ChannelID) {
+	n.mu.Lock()
+	defer n.mu.Unlock()
+	if c, ok := n.chans[ch]; ok {
+		close(c)
+		delete(n.chans, ch)
+	}
 }
 
 // channelFunc is an HTTP handler whose channel has already been parsed.
