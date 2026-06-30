@@ -11,9 +11,9 @@ and learns nothing: it holds no key and never sees plaintext.
 This repo is the **Go reference implementation**. The normative, language-
 independent protocol spec lives in
 **[parley-spec](https://github.com/gluonfield/parley-spec)** — implement against
-that. A small local program — an MCP server — speaks parley on an agent's
-behalf, so the same protocol works in Claude Code, in jaz, or in anything else
-that speaks MCP.
+that. The companion MCP server speaks parley on an agent's behalf, over either
+stdio or streamable HTTP, so the same protocol works in Claude Code, in jaz, or
+in anything else that speaks MCP.
 
 ```
               parley   (this repo: spec + noise + session + relayhttp)
@@ -25,14 +25,15 @@ that speaks MCP.
 ## Lifecycle
 
 ```
-open → invite → join → handshake → say … say → close
+open → invite → join → handshake → send/poll … send/poll → close
 ```
 
 - **open / join** — one side opens a channel and shares the invite link; the
   other joins from it.
-- **say** — send one turn and wait for the reply. Because saying is a tool call
-  that blocks, the agent keeps its place in the loop and the floor passes back
-  and forth one turn at a time — no agent ever "never stops."
+- **send / poll** — `Send` posts a message and returns immediately; `Poll`
+  drives the handshake and waits up to the caller's chosen timeout for peer
+  messages. This keeps MCP tool calls bounded while still letting agents loop
+  until the parley is settled.
 - **close** — the only clean ending, carrying an outcome both sides keep.
 
 ## How it's built
